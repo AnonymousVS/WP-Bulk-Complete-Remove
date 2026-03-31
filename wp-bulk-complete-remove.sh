@@ -317,12 +317,17 @@ step2_cleanup() {
         fi
     fi
 
-    # Empty leftover directory
+    # ลบ domain folder ทั้งหมด (รวม cgi-bin/, error_log ที่ cPanel สร้าง)
     if [[ -d "$wp_root" ]]; then
-        local fc
-        fc=$(find "$wp_root" -type f 2>/dev/null | wc -l)
-        [[ $fc -eq 0 ]] && rm -rf "$wp_root" && ((c++))
+        rm -rf "$wp_root"
+        log OK "Domain folder removed: ${wp_root}"
+        ((c++))
     fi
+    # เช็ค path อีกแบบด้วย (กรณี wp_root เป็น path แบบที่ 1 แต่มี folder ค้างใน path แบบที่ 2)
+    local alt_path1="/home/${cpuser}/${domain}"
+    local alt_path2="/home/${cpuser}/public_html/${domain}"
+    [[ -d "$alt_path1" && "$alt_path1" != "$wp_root" ]] && rm -rf "$alt_path1" && ((c++))
+    [[ -d "$alt_path2" && "$alt_path2" != "$wp_root" ]] && rm -rf "$alt_path2" && ((c++))
 
     # Safety net: ถ้า WP Toolkit ยังเห็น domain อยู่ → detach ออก
     if [[ -n "$WPTK" ]]; then
