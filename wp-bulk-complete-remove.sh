@@ -50,9 +50,9 @@ USERDOMAINS="/etc/userdomains"
 GH_USER="AnonymousVS"
 GH_REPO="WP-Bulk-Complete-Remove"
 GH_BRANCH="main"
-GH_LIST_URL="https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/${GH_BRANCH}/remove-domains-list.txt"
+GH_LIST_URL="https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/${GH_BRANCH}/remove-domains-list.csv"
 
-LOCAL_LIST="/usr/local/sbin/remove-domains-list.txt"
+LOCAL_LIST="/usr/local/sbin/remove-domains-list.csv"
 
 LOG_DIR="/var/log/wp-bulk-remove"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -74,6 +74,7 @@ AUTO_YES=false
 USE_LOCAL=false
 
 declare -a DOMAIN_LIST=()
+declare -A CPUSER_MAP=()
 
 # DB vars per domain
 DB_NAME="" ; DB_USER=""
@@ -95,10 +96,14 @@ OPTIONS:
   --help       แสดงข้อความนี้
 
 FLOW:
-  1) แก้ไข remove-domains-list.txt บน GitHub → Commit
-  2) SSH เข้าเซิร์ฟเวอร์
-  3) รัน: wp-bulk-complete-remove.sh
+  1) แก้ไข remove-domains-list.csv บน GitHub (format: domain,cpanel_user)
+  2) Login เข้า WHM Terminal
+  3) รัน: bash <(curl -sL URL/wp-bulk-complete-remove.sh)
   4) Script ดึง list → แสดง → ถาม confirm → ลบ → report
+
+CSV FORMAT:
+  domain.com,cpanel_username
+  example.co,y2026m03sv01
 
 EOF
     exit 0
@@ -160,7 +165,7 @@ fetch_domain_list() {
         spinner_start "อ่านจาก ${LOCAL_LIST}..."
     else
         spinner_start "ดึง domain list จาก GitHub..."
-        local tmp="/tmp/remove-domains-${TIMESTAMP}.txt"
+        local tmp="/tmp/remove-domains-${TIMESTAMP}.csv"
         if ! curl -sL "$GH_LIST_URL" -o "$tmp" 2>/dev/null; then
             spinner_stop; echo -e "${R}ดึงจาก GitHub ไม่สำเร็จ${N}"; exit 1
         fi
@@ -171,14 +176,70 @@ fetch_domain_list() {
         LOCAL_LIST="$tmp"
     fi
 
+    local line_num=0
+    local errors=0
+    local header_skipped=false
     while IFS= read -r line; do
-        line=$(echo "$line" | sed 's/#.*//' | tr -d '[:space:]')
+        ((line_num++))
+        # ตัด comment (#) และ trim whitespace
+        line=$(echo "$line" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [[ -z "$line" ]] && continue
-        line=$(echo "$line" | sed 's|https\?://||;s|/.*||')
-        DOMAIN_LIST+=("$line")
+
+        # ข้าม header row (บรรทัดแรกที่มีข้อมูล)
+        if ! $header_skipped; then
+            header_skipped=true
+            # ตรวจว่าเป็น header จริง (มีคำว่า domain หรือ cpanel)
+            if echo "$line" | grep -qi "domain\|cpanel\|user"; then
+                continue
+            fi
+        fi
+
+        # บังคับต้องมี comma (format: domain,cpanel_user)
+        if [[ "$line" != *","* ]]; then
+            local domain_only
+            domain_only=$(echo "$line" | tr -d '[:space:]' | sed 's|https\?://||;s|/.*||')
+            echo -e "\n  ${R}[✗]${N} บรรทัด ${line_num}: ${domain_only} — ไม่ได้ระบุ cPanel user"
+            echo -e "      ${DIM}format: domain.com,cpanel_username${N}"
+            ((errors++))
+            continue
+        fi
+
+        # แยก CSV: column A = domain, column B = cpanel user
+        local domain cpuser
+        domain=$(echo "$line" | cut -d',' -f1 | tr -d '[:space:]')
+        cpuser=$(echo "$line" | cut -d',' -f2 | tr -d '[:space:]')
+
+        # ตัด protocol + trailing slash จาก domain
+        domain=$(echo "$domain" | sed 's|https\?://||;s|/.*||')
+
+        [[ -z "$domain" ]] && continue
+
+        # บังคับต้องมี cpanel user
+        if [[ -z "$cpuser" ]]; then
+            echo -e "\n  ${R}[✗]${N} บรรทัด ${line_num}: ${domain} — ไม่ได้ระบุ cPanel user"
+            echo -e "      ${DIM}format: domain.com,cpanel_username${N}"
+            ((errors++))
+            continue
+        fi
+
+        # ตรวจว่า cPanel user มี home directory จริง
+        if [[ ! -d "/home/${cpuser}" ]]; then
+            echo -e "\n  ${R}[✗]${N} บรรทัด ${line_num}: ${domain} — ไม่พบ /home/${cpuser}"
+            ((errors++))
+            continue
+        fi
+
+        DOMAIN_LIST+=("$domain")
+        CPUSER_MAP["$domain"]="$cpuser"
     done < "$LOCAL_LIST"
 
     spinner_stop
+
+    if [[ $errors -gt 0 ]]; then
+        echo -e "${R}พบ ${errors} errors ในไฟล์ CSV — แก้ไขแล้วลองใหม่${N}"
+        exit 1
+    fi
+
     echo "โหลด domain list: ${C}${#DOMAIN_LIST[@]}${N} domains ${DIM}($(elapsed))${N}"
 }
 
@@ -349,48 +410,51 @@ process_domain() {
     local domain="$1" n="$2"
     DB_NAME=""; DB_USER=""
 
-    local cpuser wp_root found_via=""
+    # ใช้ cPanel user จาก CSV
+    local cpuser="${CPUSER_MAP[$domain]}"
 
-    # วิธีที่ 1: หาจาก /etc/userdomains (ปกติ)
-    cpuser=$(find_cpanel_user "$domain")
-    if [[ -n "$cpuser" ]]; then
-        wp_root=$(find_wp_root "$cpuser" "$domain")
-        found_via="userdomains"
-    fi
+    # หา WordPress root (เช็คทั้ง 2 paths)
+    local wp_root
+    wp_root=$(find_wp_root "$cpuser" "$domain")
 
-    # วิธีที่ 2: Fallback — scan /home/ โดยตรง (กรณี addon domain ถูกลบไปแล้ว)
+    # ถ้าไม่เจอ wp-config.php → เช็คว่ามี folder ค้างไหม
     if [[ -z "$wp_root" ]]; then
-        local scan_path
-        for scan_path in /home/*/"${domain}" /home/*/public_html/"${domain}"; do
-            if [[ -d "$scan_path" ]]; then
-                wp_root="$scan_path"
-                # ดึง username จาก path: /home/USERNAME/...
-                cpuser=$(echo "$scan_path" | cut -d'/' -f3)
-                found_via="fallback-scan"
-                break
-            fi
-        done
-    fi
+        local folder1="/home/${cpuser}/${domain}"
+        local folder2="/home/${cpuser}/public_html/${domain}"
 
-    # วิธีที่ 3: ถ้าไม่เจอ folder แต่ WP Toolkit ยังเห็นอยู่ → detach
-    if [[ -z "$wp_root" && -n "$WPTK" ]]; then
-        local orphan_id
-        orphan_id=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
-        if [[ -n "$orphan_id" && "$orphan_id" =~ ^[0-9]+$ ]]; then
+        if [[ -d "$folder1" || -d "$folder2" ]]; then
+            # มี folder ค้างแต่ไม่มี WordPress → ลบ folder + detach WP Toolkit
             if ! $DRY_RUN; then
-                $WPTK --detach -instance-id "$orphan_id" &>/dev/null
-                log OK "Detached orphan WP Toolkit instance ${orphan_id} for ${domain}"
+                [[ -d "$folder1" ]] && rm -rf "$folder1" && log OK "Leftover folder removed: ${folder1}"
+                [[ -d "$folder2" ]] && rm -rf "$folder2" && log OK "Leftover folder removed: ${folder2}"
+
+                # detach จาก WP Toolkit ถ้ายังเห็นอยู่
+                if [[ -n "$WPTK" ]]; then
+                    local orphan_id
+                    orphan_id=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
+                    [[ -n "$orphan_id" && "$orphan_id" =~ ^[0-9]+$ ]] && \
+                        $WPTK --detach -instance-id "$orphan_id" &>/dev/null
+                fi
             fi
-            progress $n $TOTAL "$domain" "${G}detached ✓${N}    "
-            report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "-" "DETACHED" "WP Toolkit orphan ID:${orphan_id}")"
+            progress $n $TOTAL "$domain" "${G}cleaned ✓${N}     "
+            report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "CLEANED" "leftover folder removed")"
             ((REMOVED++)); return
         fi
-    fi
 
-    # ไม่เจอจริงๆ → ข้าม
-    if [[ -z "$wp_root" ]]; then
+        # ไม่มี folder เลย → เช็ค WP Toolkit แล้วข้าม
+        if [[ -n "$WPTK" ]]; then
+            local orphan_id
+            orphan_id=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
+            if [[ -n "$orphan_id" && "$orphan_id" =~ ^[0-9]+$ ]]; then
+                ! $DRY_RUN && $WPTK --detach -instance-id "$orphan_id" &>/dev/null
+                progress $n $TOTAL "$domain" "${G}detached ✓${N}    "
+                report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "DETACHED" "WP Toolkit orphan")"
+                ((REMOVED++)); return
+            fi
+        fi
+
         progress $n $TOTAL "$domain" "${Y}not found${N}      "
-        report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "${cpuser:-?}" "NOT_FOUND" "ไม่พบทั้งใน userdomains และ /home/")"
+        report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "NOT_FOUND" "ไม่พบ WordPress ใน /home/${cpuser}")"
         ((NOT_FOUND++)); return
     fi
 
@@ -471,11 +535,13 @@ main() {
     # แสดง list
     echo ""
     echo -e "  ${W}รายชื่อ domain ที่จะลบ (${TOTAL} domains):${N}"
-    echo -e "  ${DIM}──────────────────────────────────────${N}"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────${N}"
+    printf "  ${DIM}%-35s %s${N}\n" "DOMAIN" "cPanel USER"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────${N}"
     local i=0
     for d in "${DOMAIN_LIST[@]}"; do
         ((i++))
-        (( i <= 20 )) && echo -e "  ${R}✗${N} ${d}"
+        (( i <= 20 )) && printf "  ${R}✗${N} %-35s ${DIM}%s${N}\n" "$d" "${CPUSER_MAP[$d]}"
         (( i == 21 && TOTAL > 20 )) && echo -e "  ${DIM}  ... และอีก $((TOTAL-20)) domains${N}"
     done
     echo -e "  ${DIM}──────────────────────────────────────${N}"
