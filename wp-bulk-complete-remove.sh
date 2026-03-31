@@ -551,6 +551,9 @@ main() {
     if ! $AUTO_YES; then
         echo -e "  ${R}⚠  การลบนี้ย้อนกลับไม่ได้ — files + database จะถูกลบถาวร${N}"
         echo ""
+        echo -e "  ${Y}Note: หากรันครั้งที่ 2 เป็นต้นไป โปรดตรวจสอบรายชื่อ domain ด้านบนให้ถูกต้อง${N}"
+        echo -e "  ${Y}      GitHub อาจ cache ไฟล์เก่าไว้ หากรายชื่อไม่ตรง ให้รอ 5 นาทีแล้วรันใหม่${N}"
+        echo ""
         read -p "  ลบทั้ง ${TOTAL} domains? (พิมพ์ yes): " confirm
         [[ "$confirm" != "yes" ]] && { echo "  ยกเลิก"; exit 0; }
         echo ""
