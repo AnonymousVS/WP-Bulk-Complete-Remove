@@ -1,37 +1,27 @@
 #!/bin/bash
 #===============================================================================
-# wp-bulk-complete-remove.sh v1.0
+# wp-bulk-complete-remove.sh v2.1
 #
 # ลบ WordPress sites แบบ completely — ไม่เหลือขยะแม้แต่ชิ้นเดียว
-# รองรับทั้ง WP Toolkit และ Softaculous installations
+# ใช้ cPanel UAPI ลบ DB/User (ชัวกว่า mysql ตรง — cPanel record ไม่เสียหาย)
+# ใช้ rm -rf ลบ files (เร็วที่สุด — cPanel ไม่ track files)
 #
-# สิ่งที่ลบ:
-#   ✓ WordPress files ทั้งหมด
-#   ✓ WordPress database
-#   ✓ Database user (orphaned)
-#   ✓ WP Toolkit instance record
-#   ✓ WP Toolkit log files
-#   ✓ .wp-toolkit/ directories
-#   ✓ .wp-toolkit-ignore file
-#   ✓ Softaculous record (ถ้ามี)
-#   ✓ .lscache/ (LiteSpeed cache)
-#   ✓ wordpress-backups/
-#   ✓ wp-content/cache/, upgrade/, tmp/
-#   ✓ wp-cron entries จาก crontab
-#   ✗ Addon domain (ใช้ script อีกตัวที่มีอยู่แล้ว)
+# สิ่งที่ลบ (11 จุด):
+#   ①  WordPress files + domain folder ทั้งหมด (rm -rf รวม cgi-bin/, error_log)
+#   ②  WordPress database (cPanel UAPI → ไม่เสียหาย database map)
+#   ③  Database user (cPanel UAPI → ไม่เหลือ ghost entry ใน cPanel GUI)
+#   ④  WP Toolkit instance record (detach) → หายจาก WP Toolkit GUI
+#   ⑤  Softaculous record (.ini) → หายจาก Softaculous GUI
+#   ⑥  .wp-toolkit/ directories
+#   ⑦  .wp-toolkit-ignore file
+#   ⑧  .lscache/ (LiteSpeed cache)
+#   ⑨  wordpress-backups/
+#   ⑩  wp-cron entries จาก user crontab
+#   ⑪  WP Toolkit log files
+#   ✗  Addon domain (ใช้ script อีกตัวแยก)
 #
-# รองรับ 2 path structures:
-#   /home/USERNAME/DOMAIN/
-#   /home/USERNAME/public_html/DOMAIN/
-#
-# Install:
-#   curl -sL https://raw.githubusercontent.com/AnonymousVS/WP-Bulk-Complete-Remove/main/wp-bulk-complete-remove.sh -o /usr/local/sbin/wp-bulk-complete-remove.sh && chmod +x /usr/local/sbin/wp-bulk-complete-remove.sh && echo "✓ Installed"
-#
-# Usage:
-#   wp-bulk-complete-remove.sh                # ดึง list จาก GitHub + ลบ
-#   wp-bulk-complete-remove.sh --local        # ใช้ local file แทน GitHub
-#   wp-bulk-complete-remove.sh --dry-run      # ทดสอบก่อน ไม่ลบจริง
-#   wp-bulk-complete-remove.sh --yes          # ไม่ถาม confirm
+# CSV Format: domain,cpanel_user
+# Log retention: 1 วัน (ลบ log เก่าอัตโนมัติ)
 #
 # GitHub: https://github.com/AnonymousVS/WP-Bulk-Complete-Remove
 # Author: AnonymousVS
@@ -43,9 +33,7 @@ set -uo pipefail
 # Configuration
 # ==============================================================================
 SCRIPT_NAME="wp-bulk-complete-remove.sh"
-SCRIPT_PATH="/usr/local/sbin/${SCRIPT_NAME}"
 WPTK="/usr/local/bin/wp-toolkit"
-USERDOMAINS="/etc/userdomains"
 
 GH_USER="AnonymousVS"
 GH_REPO="WP-Bulk-Complete-Remove"
@@ -55,29 +43,34 @@ GH_LIST_URL="https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/${GH_BRANCH
 LOCAL_LIST="/usr/local/sbin/remove-domains-list.csv"
 
 LOG_DIR="/var/log/wp-bulk-remove"
+LOG_RETENTION_DAYS=1
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="${LOG_DIR}/remove-${TIMESTAMP}.log"
 REPORT_FILE="${LOG_DIR}/report-${TIMESTAMP}.txt"
 START_TIME=$(date +%s)
 
-# Colors
+# Colors (dollar-single-quote = real ANSI codes)
 R=$'\033[0;31m'; G=$'\033[0;32m'; Y=$'\033[1;33m'
-B=$'\033[0;34m'; C=$'\033[0;36m'; W=$'\033[1;37m'; DIM=$'\033[2m'; N=$'\033[0m'
+C=$'\033[0;36m'; W=$'\033[1;37m'; DIM=$'\033[2m'; N=$'\033[0m'
 
 SPIN_CHARS='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 SPIN_PID=""
 
-declare -i TOTAL=0 REMOVED=0 CLEANED=0 FAILED=0 NOT_FOUND=0
+# Cleanup on exit (Ctrl+C, error) — kill spinner ถ้าค้าง
+cleanup_on_exit() {
+    [[ -n "$SPIN_PID" ]] && kill "$SPIN_PID" 2>/dev/null
+    printf "\r\033[K"
+}
+trap cleanup_on_exit EXIT
 
+declare -i TOTAL=0 REMOVED=0 FAILED=0 NOT_FOUND=0
 DRY_RUN=false
 AUTO_YES=false
 USE_LOCAL=false
 
 declare -a DOMAIN_LIST=()
 declare -A CPUSER_MAP=()
-
-# DB vars per domain
-DB_NAME="" ; DB_USER=""
+DB_NAME=""; DB_USER=""
 
 # ==============================================================================
 # Usage
@@ -85,7 +78,7 @@ DB_NAME="" ; DB_USER=""
 usage() {
     cat << EOF
 
-WP Bulk Complete Remove — ลบ WordPress sites แบบ completely
+WP Bulk Complete Remove v2.1 — ลบ WordPress sites แบบ completely
 
 Usage: ${SCRIPT_NAME} [OPTIONS]
 
@@ -95,28 +88,23 @@ OPTIONS:
   --local      ใช้ไฟล์ ${LOCAL_LIST} แทนดึงจาก GitHub
   --help       แสดงข้อความนี้
 
-FLOW:
-  1) แก้ไข remove-domains-list.csv บน GitHub (format: domain,cpanel_user)
-  2) Login เข้า WHM Terminal
-  3) รัน: bash <(curl -sL URL/wp-bulk-complete-remove.sh)
-  4) Script ดึง list → แสดง → ถาม confirm → ลบ → report
-
 CSV FORMAT:
-  domain.com,cpanel_username
-  example.co,y2026m03sv01
+  domain,cpanel_user
+  example.com,y2026m03sv01
 
 EOF
     exit 0
 }
 
 # ==============================================================================
-# Helpers
+# Spinner
 # ==============================================================================
 spinner_start() {
+    local msg="$1"
     {
         local i=0
         while true; do
-            printf "\r  ${C}%s${N} %s" "${SPIN_CHARS:i%${#SPIN_CHARS}:1}" "$1"
+            printf "\r  ${C}%s${N} %s" "${SPIN_CHARS:i%${#SPIN_CHARS}:1}" "$msg"
             sleep 0.1; ((i++))
         done
     } &
@@ -124,40 +112,72 @@ spinner_start() {
 }
 
 spinner_stop() {
-    [[ -n "$SPIN_PID" ]] && kill "$SPIN_PID" 2>/dev/null && wait "$SPIN_PID" 2>/dev/null
-    SPIN_PID=""; printf "\r  ${G}[✓]${N} "
+    if [[ -n "$SPIN_PID" ]] && kill -0 "$SPIN_PID" 2>/dev/null; then
+        kill "$SPIN_PID" 2>/dev/null; wait "$SPIN_PID" 2>/dev/null
+    fi
+    SPIN_PID=""
+    printf "\r  ${G}[✓]${N} "
 }
 
+# ==============================================================================
+# Elapsed time
+# ==============================================================================
 elapsed() {
     local d=$(( $(date +%s) - START_TIME ))
     (( d/60 > 0 )) && echo "$((d/60))m$((d%60))s" || echo "${d}s"
 }
 
+# ==============================================================================
+# Progress bar
+# ==============================================================================
 progress() {
-    local cur=$1 tot=$2 domain=$3 status=$4 pct=0
+    local cur=$1 tot=$2 domain=$3 status=$4
+    local pct=0
     (( tot > 0 )) && pct=$(( cur * 100 / tot ))
-    local bar="" i filled=$(( pct*25/100 )) empty=$(( 25 - pct*25/100 ))
-    for ((i=0;i<filled;i++)); do bar+="█"; done
-    for ((i=0;i<empty;i++)); do bar+="░"; done
-    printf "\r  ${C}[%3d%%]${N} %s %d/%d ${DIM}%s${N}  %-35s %s    " \
+    local filled=$(( pct * 25 / 100 ))
+    local empty=$(( 25 - filled ))
+    local bar="" i
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+    printf "\r\033[K  ${C}[%3d%%]${N} ${C}%s${N} %d/%d ${DIM}%s${N}  %-30s %s" \
         "$pct" "$bar" "$cur" "$tot" "$(elapsed)" "$domain" "$status"
 }
 
+# ==============================================================================
+# Logging
+# ==============================================================================
 log() { echo "$(date '+%H:%M:%S') [$1] $2" >> "$LOG_FILE"; }
 report_line() { echo "$1" >> "$REPORT_FILE"; }
+
+# ==============================================================================
+# Log rotation — ลบ log เก่ากว่า 1 วัน
+# ==============================================================================
+rotate_logs() {
+    [[ -d "$LOG_DIR" ]] || return
+    find "$LOG_DIR" -type f \( -name "*.log" -o -name "*.txt" \) -mtime +${LOG_RETENTION_DAYS} -delete 2>/dev/null
+}
 
 # ==============================================================================
 # Pre-checks
 # ==============================================================================
 check_requirements() {
     [[ $EUID -ne 0 ]] && { echo -e "${R}Error: ต้องรัน root${N}"; exit 1; }
-    [[ ! -f "$USERDOMAINS" ]] && { echo -e "${R}Error: ไม่พบ ${USERDOMAINS}${N}"; exit 1; }
     mkdir -p "$LOG_DIR"
-    [[ ! -x "$WPTK" ]] && { echo -e "  ${Y}[!]${N} ไม่พบ wp-toolkit CLI — จะข้าม WP Toolkit removal"; WPTK=""; }
+
+    # ตรวจว่ามี uapi command
+    if ! command -v uapi &>/dev/null; then
+        echo -e "${R}Error: ไม่พบ uapi command — ต้องใช้บน cPanel/WHM server${N}"
+        exit 1
+    fi
+
+    # wp-toolkit เป็น optional (ใช้สำหรับ detach เท่านั้น)
+    [[ ! -x "$WPTK" ]] && WPTK=""
+
+    rotate_logs
 }
 
 # ==============================================================================
-# Fetch domain list
+# Fetch + parse CSV
 # ==============================================================================
 fetch_domain_list() {
     if $USE_LOCAL; then
@@ -169,64 +189,47 @@ fetch_domain_list() {
         if ! curl -sL "$GH_LIST_URL" -o "$tmp" 2>/dev/null; then
             spinner_stop; echo -e "${R}ดึงจาก GitHub ไม่สำเร็จ${N}"; exit 1
         fi
-        # ตรวจว่าเป็น HTML error page หรือไม่
         if head -1 "$tmp" | grep -qi "<!DOCTYPE\|<html\|404\|Not Found"; then
-            spinner_stop; echo -e "${R}ไม่พบไฟล์บน GitHub — ตรวจ repo/branch ให้ถูกต้อง${N}"; exit 1
+            spinner_stop; echo -e "${R}ไม่พบไฟล์บน GitHub — ตรวจ repo/branch${N}"; exit 1
         fi
         LOCAL_LIST="$tmp"
     fi
 
-    local line_num=0
-    local errors=0
-    local header_skipped=false
+    local line_num=0 errors=0 header_skipped=false
     while IFS= read -r line; do
         ((line_num++))
-        # ตัด comment (#) และ trim whitespace
         line=$(echo "$line" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [[ -z "$line" ]] && continue
 
-        # ข้าม header row (บรรทัดแรกที่มีข้อมูล)
+        # ข้าม header row
         if ! $header_skipped; then
             header_skipped=true
-            # ตรวจว่าเป็น header จริง (มีคำว่า domain หรือ cpanel)
-            if echo "$line" | grep -qi "domain\|cpanel\|user"; then
-                continue
-            fi
+            echo "$line" | grep -qi "domain\|cpanel\|user" && continue
         fi
 
-        # บังคับต้องมี comma (format: domain,cpanel_user)
+        # บังคับต้องมี comma
         if [[ "$line" != *","* ]]; then
-            local domain_only
-            domain_only=$(echo "$line" | tr -d '[:space:]' | sed 's|https\?://||;s|/.*||')
-            echo -e "\n  ${R}[✗]${N} บรรทัด ${line_num}: ${domain_only} — ไม่ได้ระบุ cPanel user"
+            local d_only
+            d_only=$(echo "$line" | tr -d '[:space:]' | sed 's|https\?://||;s|/.*||')
+            echo -e "\n  ${R}[✗]${N} บรรทัด ${line_num}: ${d_only} — ไม่ได้ระบุ cPanel user"
             echo -e "      ${DIM}format: domain.com,cpanel_username${N}"
-            ((errors++))
-            continue
+            ((errors++)); continue
         fi
 
-        # แยก CSV: column A = domain, column B = cpanel user
         local domain cpuser
         domain=$(echo "$line" | cut -d',' -f1 | tr -d '[:space:]')
         cpuser=$(echo "$line" | cut -d',' -f2 | tr -d '[:space:]')
-
-        # ตัด protocol + trailing slash จาก domain
         domain=$(echo "$domain" | sed 's|https\?://||;s|/.*||')
-
         [[ -z "$domain" ]] && continue
 
-        # บังคับต้องมี cpanel user
         if [[ -z "$cpuser" ]]; then
             echo -e "\n  ${R}[✗]${N} บรรทัด ${line_num}: ${domain} — ไม่ได้ระบุ cPanel user"
-            echo -e "      ${DIM}format: domain.com,cpanel_username${N}"
-            ((errors++))
-            continue
+            ((errors++)); continue
         fi
 
-        # ตรวจว่า cPanel user มี home directory จริง
         if [[ ! -d "/home/${cpuser}" ]]; then
             echo -e "\n  ${R}[✗]${N} บรรทัด ${line_num}: ${domain} — ไม่พบ /home/${cpuser}"
-            ((errors++))
-            continue
+            ((errors++)); continue
         fi
 
         DOMAIN_LIST+=("$domain")
@@ -244,12 +247,8 @@ fetch_domain_list() {
 }
 
 # ==============================================================================
-# Lookup helpers
+# Helpers
 # ==============================================================================
-find_cpanel_user() {
-    grep -i "^${1}:" "$USERDOMAINS" 2>/dev/null | head -1 | awk -F': ' '{print $2}' | tr -d '[:space:]'
-}
-
 find_wp_root() {
     local u="$1" d="$2"
     local p="/home/${u}/${d}"
@@ -267,140 +266,76 @@ read_wp_config() {
     [[ -n "$DB_NAME" ]] && return 0 || return 1
 }
 
-find_wptk_instance() {
-    [[ -z "$WPTK" ]] && return 1
-    local id
-    id=$($WPTK --list 2>/dev/null | grep -i "$1" | awk '{print $1}' | head -1)
-    [[ -n "$id" && "$id" =~ ^[0-9]+$ ]] && { echo "$id"; return 0; }
-    return 1
-}
-
 # ==============================================================================
-# Step 1: Remove WordPress (sequential)
+# Remove WordPress — Manual bash + cPanel UAPI
+# ① อ่าน wp-config → ② UAPI DROP DB → ③ UAPI DROP USER
+# ④ detach WP Toolkit → ⑤ ลบ Softaculous → ⑥ cron → ⑦ WP Toolkit logs
+# ⑧ wordpress-backups → ⑨ rm -rf domain folder (สุดท้าย — ลบทุกอย่างรวม cgi-bin)
 # ==============================================================================
-step1_remove() {
-    local domain="$1" wp_root="$2" cpuser="$3"
-
-    # ลอง WP Toolkit --remove ก่อน
-    local iid
-    iid=$(find_wptk_instance "$domain") || iid=""
-    if [[ -n "$iid" && -n "$WPTK" ]]; then
-        if $WPTK --remove -instance-id "$iid" &>/dev/null; then
-            log OK "WP Toolkit removed: ${domain} (ID:${iid})"
-            echo "WPTK"; return 0
-        fi
-        log WARN "WP Toolkit remove failed for ${domain} — fallback to manual"
-    fi
-
-    # Manual removal
-    read_wp_config "$wp_root" 2>/dev/null || true
-
-    # Drop database
-    [[ -n "$DB_NAME" ]] && mysql -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" 2>/dev/null \
-        && log OK "DB dropped: ${DB_NAME}"
-
-    # Drop DB user
-    [[ -n "$DB_USER" ]] && mysql -e "DROP USER IF EXISTS '${DB_USER}'@'localhost';" 2>/dev/null \
-        && mysql -e "FLUSH PRIVILEGES;" 2>/dev/null \
-        && log OK "DB user dropped: ${DB_USER}"
-
-    # Delete files
-    [[ -d "$wp_root" ]] && rm -rf "$wp_root" && log OK "Files removed: ${wp_root}"
-
-    # Detach จาก WP Toolkit (กรณี --remove fail แต่ instance ยังค้างอยู่)
-    if [[ -n "$iid" && -n "$WPTK" ]]; then
-        $WPTK --detach -instance-id "$iid" &>/dev/null \
-            && log OK "WP Toolkit detached: ${domain} (ID:${iid})"
-    fi
-
-    echo "MANUAL"; return 0
-}
-
-# ==============================================================================
-# Step 2: Deep cleanup
-# ==============================================================================
-step2_cleanup() {
+remove_wordpress() {
     local domain="$1" wp_root="$2" cpuser="$3"
     local home="/home/${cpuser}"
-    local c=0
 
-    # .wp-toolkit/ dirs
-    for d in "${home}/${domain}/.wp-toolkit" "${home}/public_html/${domain}/.wp-toolkit"; do
-        [[ -d "$d" ]] && rm -rf "$d" && ((c++))
-    done
+    # ① อ่าน DB info จาก wp-config.php ก่อนลบ files
+    read_wp_config "$wp_root" 2>/dev/null || true
 
-    # .wp-toolkit-ignore
-    for f in "${home}/${domain}/.wp-toolkit-ignore" "${home}/public_html/${domain}/.wp-toolkit-ignore"; do
-        [[ -f "$f" ]] && rm -f "$f" && ((c++))
-    done
+    # ② DROP DATABASE ผ่าน cPanel UAPI (ไม่ทำให้ database map เสียหาย)
+    if [[ -n "$DB_NAME" ]]; then
+        uapi --user="$cpuser" Mysql delete_database name="$DB_NAME" &>/dev/null \
+            && log OK "UAPI: DB dropped: ${DB_NAME}" \
+            || log WARN "UAPI: DB drop failed: ${DB_NAME} (อาจถูกลบไปแล้ว)"
+    fi
 
-    # .lscache/
-    for d in "${home}/${domain}/.lscache" "${home}/public_html/${domain}/.lscache"; do
-        [[ -d "$d" ]] && rm -rf "$d" && ((c++))
-    done
+    # ③ DROP USER ผ่าน cPanel UAPI (ไม่เหลือ ghost entry ใน cPanel GUI)
+    if [[ -n "$DB_USER" ]]; then
+        uapi --user="$cpuser" Mysql delete_user name="$DB_USER" &>/dev/null \
+            && log OK "UAPI: DB user dropped: ${DB_USER}" \
+            || log WARN "UAPI: DB user drop failed: ${DB_USER} (อาจถูกลบไปแล้ว)"
+    fi
 
-    # wordpress-backups/ (เฉพาะ domain นี้)
-    [[ -d "${home}/wordpress-backups/${domain}" ]] && rm -rf "${home}/wordpress-backups/${domain}" && ((c++))
+    # ④ WP Toolkit — detach ออกจาก GUI (ก่อนลบ files — อาจต้องอ่าน path)
+    #    detach จะสร้าง .wp-toolkit-ignore → rm -rf ข้อ ⑧ ลบทิ้งให้
+    if [[ -n "$WPTK" ]]; then
+        local iid
+        iid=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
+        if [[ -n "$iid" && "$iid" =~ ^[0-9]+$ ]]; then
+            $WPTK --detach -instance-id "$iid" &>/dev/null \
+                && log OK "WP Toolkit detached: ID ${iid}"
+        fi
+    fi
 
-    # Leftover WP dirs
-    for sub in "wp-content/cache" "wp-content/upgrade" "wp-content/tmp" "wp-content/ai1wm-backups" "wp-content/updraft"; do
-        [[ -d "${wp_root}/${sub}" ]] && rm -rf "${wp_root}/${sub}" && ((c++))
-    done
-
-    # Softaculous records
+    # ⑤ Softaculous record — ลบ .ini ออกจาก GUI
     if [[ -d "/var/softaculous/installations" ]]; then
         local ini
         ini=$(find /var/softaculous/installations/ -name "*.ini" -exec grep -l "${domain}" {} \; 2>/dev/null || true)
-        [[ -n "$ini" ]] && echo "$ini" | xargs rm -f 2>/dev/null && ((c++)) && log OK "Softaculous record removed"
+        if [[ -n "$ini" ]]; then
+            echo "$ini" | xargs rm -f 2>/dev/null
+            log OK "Softaculous record removed"
+        fi
     fi
 
-    # wp-cron in user crontab
-    local crontab="/var/spool/cron/${cpuser}"
-    if [[ -f "$crontab" ]] && grep -q "$domain" "$crontab" 2>/dev/null; then
-        sed -i "/${domain//./\\.}/d" "$crontab" 2>/dev/null && ((c++))
+    # ⑥ wp-cron entries จาก user crontab
+    local user_cron="/var/spool/cron/${cpuser}"
+    if [[ -f "$user_cron" ]] && grep -q "$domain" "$user_cron" 2>/dev/null; then
+        sed -i "/${domain//./\\.}/d" "$user_cron" 2>/dev/null
     fi
 
-    # WP Toolkit logs
+    # ⑦ WP Toolkit log files
     [[ -d "/usr/local/cpanel/3rdparty/wp-toolkit/var/logs" ]] && \
-        find /usr/local/cpanel/3rdparty/wp-toolkit/var/logs/ -name "*${domain}*" -delete 2>/dev/null && ((c++))
+        find /usr/local/cpanel/3rdparty/wp-toolkit/var/logs/ -name "*${domain}*" -delete 2>/dev/null
 
-    # Orphaned DB user (ถ้า WP Toolkit ลบ DB แล้วแต่ไม่ลบ user)
-    if [[ -n "${DB_USER:-}" ]]; then
-        local exists
-        exists=$(mysql -N -e "SELECT User FROM mysql.user WHERE User='${DB_USER}' AND Host='localhost';" 2>/dev/null || true)
-        if [[ -n "$exists" ]]; then
-            local db_exists
-            db_exists=$(mysql -N -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME:-}';" 2>/dev/null || true)
-            if [[ -z "$db_exists" ]]; then
-                mysql -e "DROP USER IF EXISTS '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;" 2>/dev/null && ((c++))
-                log OK "Orphaned DB user removed: ${DB_USER}"
-            fi
-        fi
-    fi
+    # ⑧ wordpress-backups/ (เฉพาะ domain นี้ — อยู่คนละที่กับ domain folder)
+    [[ -d "${home}/wordpress-backups/${domain}" ]] && rm -rf "${home}/wordpress-backups/${domain}"
 
-    # ลบ domain folder ทั้งหมด (รวม cgi-bin/, error_log ที่ cPanel สร้าง)
-    if [[ -d "$wp_root" ]]; then
-        rm -rf "$wp_root"
-        log OK "Domain folder removed: ${wp_root}"
-        ((c++))
-    fi
-    # เช็ค path อีกแบบด้วย (กรณี wp_root เป็น path แบบที่ 1 แต่มี folder ค้างใน path แบบที่ 2)
-    local alt_path1="/home/${cpuser}/${domain}"
-    local alt_path2="/home/${cpuser}/public_html/${domain}"
-    [[ -d "$alt_path1" && "$alt_path1" != "$wp_root" ]] && rm -rf "$alt_path1" && ((c++))
-    [[ -d "$alt_path2" && "$alt_path2" != "$wp_root" ]] && rm -rf "$alt_path2" && ((c++))
+    # ⑨ ลบ domain folder ทั้งหมด — ทำเป็นขั้นตอนสุดท้าย
+    #    rm -rf ลบทุกอย่างใน folder: WordPress files, cgi-bin/, error_log,
+    #    .wp-toolkit/, .wp-toolkit-ignore, .lscache/, wp-content/cache/ ฯลฯ
+    local path1="/home/${cpuser}/${domain}"
+    local path2="/home/${cpuser}/public_html/${domain}"
+    [[ -d "$path1" ]] && rm -rf "$path1" && log OK "Removed: ${path1}"
+    [[ -d "$path2" ]] && rm -rf "$path2" && log OK "Removed: ${path2}"
 
-    # Safety net: ถ้า WP Toolkit ยังเห็น domain อยู่ → detach ออก
-    if [[ -n "$WPTK" ]]; then
-        local leftover_id
-        leftover_id=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
-        if [[ -n "$leftover_id" && "$leftover_id" =~ ^[0-9]+$ ]]; then
-            $WPTK --detach -instance-id "$leftover_id" &>/dev/null && ((c++))
-            log OK "Safety net: WP Toolkit detached leftover instance ${leftover_id} for ${domain}"
-        fi
-    fi
-
-    echo "$c"
+    return 0
 }
 
 # ==============================================================================
@@ -410,77 +345,67 @@ process_domain() {
     local domain="$1" n="$2"
     DB_NAME=""; DB_USER=""
 
-    # ใช้ cPanel user จาก CSV
     local cpuser="${CPUSER_MAP[$domain]}"
 
     # หา WordPress root (เช็คทั้ง 2 paths)
     local wp_root
     wp_root=$(find_wp_root "$cpuser" "$domain")
 
-    # ถ้าไม่เจอ wp-config.php → เช็คว่ามี folder ค้างไหม
+    # ถ้าไม่เจอ wp-config → เช็คว่ามี folder ค้างไหม
     if [[ -z "$wp_root" ]]; then
-        local folder1="/home/${cpuser}/${domain}"
-        local folder2="/home/${cpuser}/public_html/${domain}"
+        local f1="/home/${cpuser}/${domain}"
+        local f2="/home/${cpuser}/public_html/${domain}"
 
-        if [[ -d "$folder1" || -d "$folder2" ]]; then
-            # มี folder ค้างแต่ไม่มี WordPress → ลบ folder + detach WP Toolkit
+        if [[ -d "$f1" || -d "$f2" ]]; then
             if ! $DRY_RUN; then
-                [[ -d "$folder1" ]] && rm -rf "$folder1" && log OK "Leftover folder removed: ${folder1}"
-                [[ -d "$folder2" ]] && rm -rf "$folder2" && log OK "Leftover folder removed: ${folder2}"
-
-                # detach จาก WP Toolkit ถ้ายังเห็นอยู่
+                [[ -d "$f1" ]] && rm -rf "$f1" && log OK "Leftover removed: ${f1}"
+                [[ -d "$f2" ]] && rm -rf "$f2" && log OK "Leftover removed: ${f2}"
+                # detach จาก WP Toolkit + Softaculous
                 if [[ -n "$WPTK" ]]; then
-                    local orphan_id
-                    orphan_id=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
-                    [[ -n "$orphan_id" && "$orphan_id" =~ ^[0-9]+$ ]] && \
-                        $WPTK --detach -instance-id "$orphan_id" &>/dev/null
+                    local oid
+                    oid=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
+                    [[ -n "$oid" && "$oid" =~ ^[0-9]+$ ]] && $WPTK --detach -instance-id "$oid" &>/dev/null
                 fi
+                [[ -d "/var/softaculous/installations" ]] && \
+                    find /var/softaculous/installations/ -name "*.ini" -exec grep -l "${domain}" {} \; 2>/dev/null | xargs rm -f 2>/dev/null
             fi
-            progress $n $TOTAL "$domain" "${G}cleaned ✓${N}     "
+            progress $n $TOTAL "$domain" "${G}cleaned ✓${N}"
             report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "CLEANED" "leftover folder removed")"
             ((REMOVED++)); return
         fi
 
-        # ไม่มี folder เลย → เช็ค WP Toolkit แล้วข้าม
+        # ไม่มี folder → เช็ค WP Toolkit
         if [[ -n "$WPTK" ]]; then
-            local orphan_id
-            orphan_id=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
-            if [[ -n "$orphan_id" && "$orphan_id" =~ ^[0-9]+$ ]]; then
-                ! $DRY_RUN && $WPTK --detach -instance-id "$orphan_id" &>/dev/null
-                progress $n $TOTAL "$domain" "${G}detached ✓${N}    "
+            local oid
+            oid=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
+            if [[ -n "$oid" && "$oid" =~ ^[0-9]+$ ]]; then
+                ! $DRY_RUN && $WPTK --detach -instance-id "$oid" &>/dev/null
+                progress $n $TOTAL "$domain" "${G}detached ✓${N}"
                 report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "DETACHED" "WP Toolkit orphan")"
                 ((REMOVED++)); return
             fi
         fi
 
-        progress $n $TOTAL "$domain" "${Y}not found${N}      "
-        report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "NOT_FOUND" "ไม่พบ WordPress ใน /home/${cpuser}")"
+        progress $n $TOTAL "$domain" "${Y}not found${N}"
+        report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "NOT_FOUND" "ไม่พบใน /home/${cpuser}")"
         ((NOT_FOUND++)); return
     fi
 
-    # อ่าน DB info ก่อน (ใช้ใน cleanup)
-    read_wp_config "$wp_root" 2>/dev/null || true
-
+    # Dry run
     if $DRY_RUN; then
+        read_wp_config "$wp_root" 2>/dev/null || true
         progress $n $TOTAL "$domain" "${Y}[DRY] would remove${N}"
-        report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "DRY_RUN" "${wp_root}")"
+        report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "DRY_RUN" "DB:${DB_NAME:-?} User:${DB_USER:-?}")"
         ((REMOVED++)); return
     fi
 
-    # Step 1
-    progress $n $TOTAL "$domain" "${Y}removing...${N}    "
-    local method
-    method=$(step1_remove "$domain" "$wp_root" "$cpuser")
-
-    # Step 2
-    progress $n $TOTAL "$domain" "${Y}cleaning...${N}    "
-    local cleaned
-    cleaned=$(step2_cleanup "$domain" "$wp_root" "$cpuser")
-
-    progress $n $TOTAL "$domain" "${G}done ✓${N}         "
-    report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "REMOVED" "via:${method} cleaned:${cleaned}")"
-    log OK "Complete: ${domain} (${method}, cleaned:${cleaned})"
-    ((REMOVED++)); ((CLEANED+=cleaned))
+    # ลบจริง
+    progress $n $TOTAL "$domain" "${Y}removing...${N}"
+    remove_wordpress "$domain" "$wp_root" "$cpuser"
+    progress $n $TOTAL "$domain" "${G}done ✓${N}"
+    report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "REMOVED" "DB:${DB_NAME:-?} User:${DB_USER:-?}")"
+    log OK "Complete: ${domain} (DB:${DB_NAME:-?} User:${DB_USER:-?})"
+    ((REMOVED++))
 }
 
 # ==============================================================================
@@ -491,10 +416,11 @@ print_summary() {
     {
         echo ""; echo "============================================================"
         echo "SUMMARY"; echo "============================================================"
-        echo "Total: ${TOTAL}  Removed: ${REMOVED}  Cleaned: ${CLEANED}  Failed: ${FAILED}  Not found: ${NOT_FOUND}"
+        echo "Total: ${TOTAL}  Removed: ${REMOVED}  Failed: ${FAILED}  Not found: ${NOT_FOUND}"
         echo "Elapsed: ${el}"
     } >> "$REPORT_FILE"
 
+    printf "\r\033[K"
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
     echo -e "${C}  RESULTS                                       ${DIM}elapsed: ${el}${N}"
@@ -503,7 +429,6 @@ print_summary() {
     echo -e "  Total domains:     ${W}${TOTAL}${N}"
     echo ""
     echo -e "  ${G}✓${N} Removed:           ${G}${REMOVED}${N}"
-    echo -e "  ${G}✓${N} Items cleaned:     ${G}${CLEANED}${N}"
     echo -e "  ${R}✗${N} Failed:            ${R}${FAILED}${N}"
     echo -e "  ${Y}→${N} Not found:         ${Y}${NOT_FOUND}${N}"
     echo ""
@@ -520,7 +445,7 @@ print_summary() {
 main() {
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    echo -e "${C}  WP Bulk Complete Remove${N}"
+    echo -e "${C}  WP Bulk Complete Remove ${DIM}v2.1${N}"
     echo -e "${C}  ลบ WordPress sites แบบ completely — ไม่เหลือขยะ${N}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
     echo ""
@@ -544,7 +469,7 @@ main() {
         (( i <= 20 )) && printf "  ${R}✗${N} %-35s ${DIM}%s${N}\n" "$d" "${CPUSER_MAP[$d]}"
         (( i == 21 && TOTAL > 20 )) && echo -e "  ${DIM}  ... และอีก $((TOTAL-20)) domains${N}"
     done
-    echo -e "  ${DIM}──────────────────────────────────────${N}"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────${N}"
     echo ""
 
     # Confirm
@@ -561,7 +486,7 @@ main() {
 
     # Report header
     {
-        echo "WP Bulk Complete Remove Report — $(date)"
+        echo "WP Bulk Complete Remove v2.1 Report — $(date)"
         echo "Server: $(hostname) | Dry Run: ${DRY_RUN} | Total: ${TOTAL}"
         echo "============================================================"
         printf "%-35s %-15s %-12s %s\n" "DOMAIN" "USER" "STATUS" "DETAIL"
@@ -570,15 +495,13 @@ main() {
     echo -e "  ${W}เริ่มลบ...${N}"
     echo ""
 
-    # Process (sequential — ปลอดภัย)
+    # Process (sequential)
     local n=0
     for d in "${DOMAIN_LIST[@]}"; do
         ((n++))
         process_domain "$d" "$n"
-        sleep 0.2
     done
 
-    printf "\r%100s\r" ""
     print_summary
 }
 
