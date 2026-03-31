@@ -246,6 +246,12 @@ step1_remove() {
     # Delete files
     [[ -d "$wp_root" ]] && rm -rf "$wp_root" && log OK "Files removed: ${wp_root}"
 
+    # Detach จาก WP Toolkit (กรณี --remove fail แต่ instance ยังค้างอยู่)
+    if [[ -n "$iid" && -n "$WPTK" ]]; then
+        $WPTK --detach -instance-id "$iid" &>/dev/null \
+            && log OK "WP Toolkit detached: ${domain} (ID:${iid})"
+    fi
+
     echo "MANUAL"; return 0
 }
 
@@ -318,6 +324,16 @@ step2_cleanup() {
         [[ $fc -eq 0 ]] && rm -rf "$wp_root" && ((c++))
     fi
 
+    # Safety net: ถ้า WP Toolkit ยังเห็น domain อยู่ → detach ออก
+    if [[ -n "$WPTK" ]]; then
+        local leftover_id
+        leftover_id=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
+        if [[ -n "$leftover_id" && "$leftover_id" =~ ^[0-9]+$ ]]; then
+            $WPTK --detach -instance-id "$leftover_id" &>/dev/null && ((c++))
+            log OK "Safety net: WP Toolkit detached leftover instance ${leftover_id} for ${domain}"
+        fi
+    fi
+
     echo "$c"
 }
 
@@ -328,19 +344,48 @@ process_domain() {
     local domain="$1" n="$2"
     DB_NAME=""; DB_USER=""
 
-    local cpuser
+    local cpuser wp_root found_via=""
+
+    # วิธีที่ 1: หาจาก /etc/userdomains (ปกติ)
     cpuser=$(find_cpanel_user "$domain")
-    if [[ -z "$cpuser" ]]; then
-        progress $n $TOTAL "$domain" "${Y}not in server${N}"
-        report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "-" "NOT_FOUND" "ไม่พบใน /etc/userdomains")"
-        ((NOT_FOUND++)); return
+    if [[ -n "$cpuser" ]]; then
+        wp_root=$(find_wp_root "$cpuser" "$domain")
+        found_via="userdomains"
     fi
 
-    local wp_root
-    wp_root=$(find_wp_root "$cpuser" "$domain")
+    # วิธีที่ 2: Fallback — scan /home/ โดยตรง (กรณี addon domain ถูกลบไปแล้ว)
     if [[ -z "$wp_root" ]]; then
-        progress $n $TOTAL "$domain" "${Y}no WordPress${N} "
-        report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "$cpuser" "NO_WP" "ไม่พบ wp-config.php")"
+        local scan_path
+        for scan_path in /home/*/"${domain}" /home/*/public_html/"${domain}"; do
+            if [[ -d "$scan_path" ]]; then
+                wp_root="$scan_path"
+                # ดึง username จาก path: /home/USERNAME/...
+                cpuser=$(echo "$scan_path" | cut -d'/' -f3)
+                found_via="fallback-scan"
+                break
+            fi
+        done
+    fi
+
+    # วิธีที่ 3: ถ้าไม่เจอ folder แต่ WP Toolkit ยังเห็นอยู่ → detach
+    if [[ -z "$wp_root" && -n "$WPTK" ]]; then
+        local orphan_id
+        orphan_id=$($WPTK --list 2>/dev/null | grep -i "$domain" | awk '{print $1}' | head -1)
+        if [[ -n "$orphan_id" && "$orphan_id" =~ ^[0-9]+$ ]]; then
+            if ! $DRY_RUN; then
+                $WPTK --detach -instance-id "$orphan_id" &>/dev/null
+                log OK "Detached orphan WP Toolkit instance ${orphan_id} for ${domain}"
+            fi
+            progress $n $TOTAL "$domain" "${G}detached ✓${N}    "
+            report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "-" "DETACHED" "WP Toolkit orphan ID:${orphan_id}")"
+            ((REMOVED++)); return
+        fi
+    fi
+
+    # ไม่เจอจริงๆ → ข้าม
+    if [[ -z "$wp_root" ]]; then
+        progress $n $TOTAL "$domain" "${Y}not found${N}      "
+        report_line "$(printf '%-35s %-15s %-12s %s' "$domain" "${cpuser:-?}" "NOT_FOUND" "ไม่พบทั้งใน userdomains และ /home/")"
         ((NOT_FOUND++)); return
     fi
 
